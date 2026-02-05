@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlencode, urlparse, quote
 
 import requests
@@ -20,6 +20,8 @@ except Exception:  # pragma: no cover
 
 
 LOG = logging.getLogger("htx-telegram-bot")
+UNSUPPORTED_PRICE_SYMBOLS: Set[str] = set()
+UNSUPPORTED_PRICE_SYMBOLS_LOCK = threading.Lock()
 
 
 def _env(name: str, default: Optional[str] = None, required: bool = False) -> str:
@@ -52,7 +54,7 @@ def _parse_csv(value: str) -> List[str]:
 
 
 def _now_utc_iso() -> str:
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
 @dataclass
@@ -79,8 +81,6 @@ class Config:
     ai_api_key: Optional[str]
     ai_model: Optional[str]
     ai_timeout: int
-
-    total_money: float
 
     total_money: float
 
@@ -352,6 +352,10 @@ def _symbol_for_currency(currency: str) -> str:
     return f"{currency.lower()}usdt"
 
 
+def _is_invalid_symbol_error(exc: Exception) -> bool:
+    return "invalid symbol" in str(exc).lower()
+
+
 def _build_ai_chat_url(base_url: str) -> str:
     base = (base_url or "").strip().rstrip("/")
     if not base:
@@ -504,10 +508,17 @@ def _price_map(htx: HTXClient, symbols: List[str]) -> Dict[str, float]:
     for symbol in symbols:
         if not symbol:
             continue
+        with UNSUPPORTED_PRICE_SYMBOLS_LOCK:
+            if symbol in UNSUPPORTED_PRICE_SYMBOLS:
+                continue
         try:
             tick = htx.get_market_detail(symbol)
         except Exception as exc:
-            LOG.info("Skip unsupported symbol '%s' for pricing: %s", symbol, exc)
+            if _is_invalid_symbol_error(exc):
+                with UNSUPPORTED_PRICE_SYMBOLS_LOCK:
+                    UNSUPPORTED_PRICE_SYMBOLS.add(symbol)
+                continue
+            LOG.warning("Price lookup failed for symbol '%s': %s", symbol, exc)
             continue
         price = tick.get("close")
         if price is not None:
