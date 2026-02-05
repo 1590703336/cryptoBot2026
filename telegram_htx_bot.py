@@ -179,14 +179,19 @@ class TelegramBot:
 
     def send_message(self, text: str) -> None:
         payload = {"chat_id": self.chat_id, "text": text}
-        try:
-            resp = requests.post(f"{self.base_url}/sendMessage", json=payload, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            if not data.get("ok", False):
-                LOG.warning("Telegram sendMessage returned error: %s", data)
-        except Exception as exc:
-            LOG.warning("Telegram send_message failed: %s", exc)
+        for attempt in range(2):
+            try:
+                resp = requests.post(f"{self.base_url}/sendMessage", json=payload, timeout=15)
+                resp.raise_for_status()
+                data = resp.json()
+                if not data.get("ok", False):
+                    LOG.warning("Telegram sendMessage returned error: %s", data)
+                return
+            except Exception as exc:
+                if attempt == 0:
+                    time.sleep(1)
+                    continue
+                LOG.warning("Telegram send_message failed after retry: %s", exc)
 
     def get_updates(self) -> List[Dict]:
         params = {"timeout": self.timeout}
@@ -273,15 +278,10 @@ class OrderTracker:
                     state = order.get("state", "")
                     if order_id not in self.last_seen:
                         self.last_seen[order_id] = state
-                        self.bot.send_message(
-                            f"New buy order: {order.get('symbol')} #{order_id} state={state} "
-                            f"type={order.get('type')} price={order.get('price')} amount={order.get('amount')}"
-                        )
+                        self.bot.send_message("New Buy Order\n" + _order_text(order))
                     elif self.last_seen[order_id] != state:
                         self.last_seen[order_id] = state
-                        self.bot.send_message(
-                            f"Order update: {order.get('symbol')} #{order_id} state={state}"
-                        )
+                        self.bot.send_message("Order Updated\n" + _order_text(order))
             except Exception as exc:
                 LOG.warning("Order tracker error: %s", exc)
             stop_event.wait(self.config.order_poll_seconds)
@@ -291,6 +291,45 @@ def _format_price(value: Optional[float]) -> str:
     if value is None:
         return "n/a"
     return f"{value:.6f}" if value < 1 else f"{value:.2f}"
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_symbol(symbol: str) -> str:
+    upper = (symbol or "").upper()
+    if upper.endswith("USDT") and len(upper) > 4:
+        return f"{upper[:-4]}/USDT"
+    return upper or "N/A"
+
+
+def _format_order_type(order_type: str) -> str:
+    return (order_type or "").replace("-", " ").upper() or "N/A"
+
+
+def _order_value_usdt(order: Dict) -> float:
+    price = _safe_float(order.get("price"))
+    amount = _safe_float(order.get("amount"))
+    return price * amount
+
+
+def _order_text(order: Dict) -> str:
+    symbol = _format_symbol(order.get("symbol", ""))
+    order_type = _format_order_type(order.get("type", ""))
+    state = (order.get("state", "") or "").replace("-", " ").upper() or "N/A"
+    price = _safe_float(order.get("price"))
+    value = _order_value_usdt(order)
+    return (
+        f"Pair: {symbol}\n"
+        f"Type: {order_type}\n"
+        f"State: {state}\n"
+        f"Limit Price: {price:,.2f} USDT\n"
+        f"Order Value: {value:,.2f} USDT"
+    )
 
 
 def _compute_change(open_price: Optional[float], close_price: Optional[float]) -> Tuple[str, str]:
@@ -313,10 +352,28 @@ def _symbol_for_currency(currency: str) -> str:
     return f"{currency.lower()}usdt"
 
 
+def _build_ai_chat_url(base_url: str) -> str:
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        return ""
+    lower = base.lower()
+    if lower.endswith("/chat/completions"):
+        return base
+    if lower.endswith("/api/v1") or lower.endswith("/v1"):
+        return base + "/chat/completions"
+    if lower.endswith("/api"):
+        return base + "/v1/chat/completions"
+
+    parsed = urlparse(base)
+    if parsed.netloc.lower() == "openrouter.ai":
+        return base + "/api/v1/chat/completions"
+    return base + "/v1/chat/completions"
+
+
 def _call_ai_report(config: Config, facts: str) -> str:
     if not (config.ai_api_url and config.ai_api_key and config.ai_model):
         return "AI report is not configured. Set AI_API_URL, AI_API_KEY, and AI_MODEL."
-    url = config.ai_api_url.rstrip("/") + "/v1/chat/completions"
+    url = _build_ai_chat_url(config.ai_api_url)
     headers = {
         "Authorization": f"Bearer {config.ai_api_key}",
         "Content-Type": "application/json",
@@ -337,10 +394,27 @@ def _call_ai_report(config: Config, facts: str) -> str:
         "temperature": 0.3,
         "max_tokens": 400,
     }
-    resp = requests.post(url, headers=headers, json=payload, timeout=config.ai_timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    return data["choices"][0]["message"]["content"].strip()
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=config.ai_timeout)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        return (
+            f"AI report request failed ({status}) at {url}. "
+            "Check AI_API_URL and AI_MODEL."
+        )
+    except Exception as exc:
+        return f"AI report request failed: {exc}"
+
+    choices = data.get("choices") or []
+    if not choices:
+        return "AI report API returned no choices."
+    message = choices[0].get("message") or {}
+    content = (message.get("content") or "").strip()
+    if not content:
+        return "AI report API returned empty content."
+    return content
 
 
 class DailyReporter:
@@ -412,13 +486,10 @@ def _fetch_orders_text(tracker: OrderTracker) -> str:
     orders = tracker._fetch_orders()
     if not orders:
         return "No buy orders found."
-    lines = []
+    lines: List[str] = []
     for order in orders[:10]:
-        lines.append(
-            f"{order.get('symbol')} #{order.get('id')} {order.get('state')} "
-            f"{order.get('type')} price={order.get('price')} amount={order.get('amount')}"
-        )
-    return "\n".join(lines)
+        lines.append(_order_text(order))
+    return "\n\n".join(lines)
 
 
 def _ensure_account_id(htx: HTXClient, config: Config) -> str:
@@ -433,7 +504,11 @@ def _price_map(htx: HTXClient, symbols: List[str]) -> Dict[str, float]:
     for symbol in symbols:
         if not symbol:
             continue
-        tick = htx.get_market_detail(symbol)
+        try:
+            tick = htx.get_market_detail(symbol)
+        except Exception as exc:
+            LOG.info("Skip unsupported symbol '%s' for pricing: %s", symbol, exc)
+            continue
         price = tick.get("close")
         if price is not None:
             prices[symbol] = float(price)
@@ -449,24 +524,10 @@ def _open_orders_text(htx: HTXClient, config: Config) -> str:
     if not orders:
         return "No open spot orders."
 
-    prices = _price_map(htx, list({o.get("symbol", "") for o in orders if o.get("symbol")}))
-    lines = []
-    total_money = config.total_money or 0
+    lines: List[str] = []
     for order in orders:
-        symbol = order.get("symbol", "")
-        price = float(order.get("price") or 0)
-        amount = float(order.get("amount") or 0)
-        side = order.get("type", "")
-        state = order.get("state", "")
-        filled = float(order.get("field-amount") or 0)
-        current_price = prices.get(symbol)
-        value_usd = (current_price or 0) * amount
-        percent = f"{(value_usd / total_money * 100):.2f}%" if total_money else "n/a"
-        lines.append(
-            f"{symbol.upper()} #{order.get('id')} {state} {side} price={price} amount={amount} filled={filled} "
-            f"now_price={_format_price(current_price)} order_value_usdt={value_usd:.2f} of total={percent}"
-        )
-    return "\n".join(lines)
+        lines.append(_order_text(order))
+    return "\n\n".join(lines)
 
 
 def _history_text(htx: HTXClient, config: Config) -> str:
