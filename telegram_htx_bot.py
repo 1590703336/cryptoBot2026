@@ -179,16 +179,30 @@ class TelegramBot:
 
     def send_message(self, text: str) -> None:
         payload = {"chat_id": self.chat_id, "text": text}
-        requests.post(f"{self.base_url}/sendMessage", json=payload, timeout=10)
+        try:
+            resp = requests.post(f"{self.base_url}/sendMessage", json=payload, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("ok", False):
+                LOG.warning("Telegram sendMessage returned error: %s", data)
+        except Exception as exc:
+            LOG.warning("Telegram send_message failed: %s", exc)
 
     def get_updates(self) -> List[Dict]:
         params = {"timeout": self.timeout}
         if self.last_update_id is not None:
             params["offset"] = self.last_update_id + 1
-        resp = requests.get(f"{self.base_url}/getUpdates", params=params, timeout=self.timeout + 5)
-        resp.raise_for_status()
-        data = resp.json()
-        return data.get("result", [])
+        try:
+            resp = requests.get(f"{self.base_url}/getUpdates", params=params, timeout=self.timeout + 5)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data.get("ok", False):
+                LOG.warning("Telegram getUpdates returned error: %s", data)
+                return []
+            return data.get("result", [])
+        except Exception as exc:
+            LOG.warning("Telegram get_updates failed: %s", exc)
+            return []
 
     def handle_updates(self, handler) -> None:
         for update in self.get_updates():
@@ -201,7 +215,10 @@ class TelegramBot:
                 continue
             if chat_id != self.chat_id:
                 continue
-            handler(text)
+            try:
+                handler(text)
+            except Exception as exc:
+                LOG.warning("Command handler failed for message '%s': %s", text, exc)
 
 
 def _get_timezone(name: str):
@@ -221,6 +238,7 @@ class OrderTracker:
         self.bot = bot
         self.config = config
         self.last_seen: Dict[str, str] = {}
+        self._seeded = False
 
     def _fetch_orders(self) -> List[Dict]:
         if self.config.order_source == "open":
@@ -241,6 +259,15 @@ class OrderTracker:
         while not stop_event.is_set():
             try:
                 orders = self._fetch_orders()
+                if not self._seeded:
+                    for order in orders:
+                        order_id = str(order.get("id"))
+                        state = order.get("state", "")
+                        self.last_seen[order_id] = state
+                    self._seeded = True
+                    LOG.info("Order tracker seeded with %d existing orders", len(orders))
+                    stop_event.wait(self.config.order_poll_seconds)
+                    continue
                 for order in orders:
                     order_id = str(order.get("id"))
                     state = order.get("state", "")
@@ -293,6 +320,8 @@ def _call_ai_report(config: Config, facts: str) -> str:
     headers = {
         "Authorization": f"Bearer {config.ai_api_key}",
         "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/huanzhang/cryptoBot2026", # Required by OpenRouter
+        "X-Title": "CryptoBot2026", # Optional: Title for OpenRouter
     }
     prompt = (
         "You are a crypto market assistant. Write a concise daily BTC report based only on the facts. "
@@ -595,7 +624,11 @@ def main() -> None:
 
     try:
         while True:
-            bot.handle_updates(on_command)
+            try:
+                bot.handle_updates(on_command)
+            except Exception as exc:
+                LOG.warning("Main loop polling error: %s", exc)
+                time.sleep(2)
     except KeyboardInterrupt:
         LOG.info("Shutting down")
         stop_event.set()
