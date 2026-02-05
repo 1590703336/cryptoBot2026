@@ -176,6 +176,20 @@ class TestTelegramBot(unittest.TestCase):
         with patch("telegram_htx_bot.requests.post", side_effect=[Exception("x"), Exception("y")]):
             bot.send_message("hello")
 
+    def test_message_chunks_splits_long_text(self):
+        bot = botmod.TelegramBot("token", 1)
+        text = "a" * 4000 + "\n" + "b" * 4000
+        chunks = bot._message_chunks(text, max_len=3800)
+        self.assertGreater(len(chunks), 2)
+        self.assertEqual("".join(chunks), text)
+        self.assertTrue(all(len(c) <= 3800 for c in chunks))
+
+    def test_send_message_sends_multiple_chunks(self):
+        bot = botmod.TelegramBot("token", 1)
+        with patch.object(bot, "_message_chunks", return_value=["x", "y"]), patch.object(bot, "_send_single_message") as send_mock:
+            bot.send_message("whatever")
+        self.assertEqual(send_mock.call_count, 2)
+
     def test_get_updates_success(self):
         bot = botmod.TelegramBot("token", 1)
         with patch("telegram_htx_bot.requests.get", return_value=DummyResponse({"ok": True, "result": [{"update_id": 1}]})):
@@ -199,8 +213,11 @@ class TestTelegramBot(unittest.TestCase):
             ],
         ):
             handler = Mock(side_effect=[RuntimeError("bad")])
-            bot.handle_updates(handler)
+            with patch.object(bot, "send_message") as send_mock:
+                bot.handle_updates(handler)
         handler.assert_called_once_with("/ok")
+        send_mock.assert_called_once()
+        self.assertIn("Command failed:", send_mock.call_args.args[0])
 
 
 class TestOrderTracker(unittest.TestCase):

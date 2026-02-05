@@ -177,7 +177,35 @@ class TelegramBot:
         self.base_url = f"https://api.telegram.org/bot{token}"
         self.last_update_id: Optional[int] = None
 
-    def send_message(self, text: str) -> None:
+    def _message_chunks(self, text: str, max_len: int = 3800) -> List[str]:
+        if len(text) <= max_len:
+            return [text]
+        chunks: List[str] = []
+        current: List[str] = []
+        current_len = 0
+        for line in text.splitlines(keepends=True):
+            if len(line) > max_len:
+                if current:
+                    chunks.append("".join(current))
+                    current = []
+                    current_len = 0
+                start = 0
+                while start < len(line):
+                    chunks.append(line[start:start + max_len])
+                    start += max_len
+                continue
+            if current_len + len(line) > max_len:
+                chunks.append("".join(current))
+                current = [line]
+                current_len = len(line)
+            else:
+                current.append(line)
+                current_len += len(line)
+        if current:
+            chunks.append("".join(current))
+        return chunks
+
+    def _send_single_message(self, text: str) -> None:
         payload = {"chat_id": self.chat_id, "text": text}
         for attempt in range(2):
             try:
@@ -192,6 +220,11 @@ class TelegramBot:
                     time.sleep(1)
                     continue
                 LOG.warning("Telegram send_message failed after retry: %s", exc)
+                return
+
+    def send_message(self, text: str) -> None:
+        for chunk in self._message_chunks(text):
+            self._send_single_message(chunk)
 
     def get_updates(self) -> List[Dict]:
         params = {"timeout": self.timeout}
@@ -219,11 +252,13 @@ class TelegramBot:
             if not text:
                 continue
             if chat_id != self.chat_id:
+                LOG.info("Ignored command from chat_id=%s (expected=%s): %s", chat_id, self.chat_id, text)
                 continue
             try:
                 handler(text)
             except Exception as exc:
                 LOG.warning("Command handler failed for message '%s': %s", text, exc)
+                self.send_message(f"Command failed: {exc}")
 
 
 def _get_timezone(name: str):
